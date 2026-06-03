@@ -1,32 +1,54 @@
 # philgeps_scrape.py
 #
-# PhilGEPS public scraper (no login) — portal-tab aware + auto "Detailed/Advanced Search".
-# - Opens the PhilGEPS home, clicks the “click Here” link (captures the NEW TAB), or opens portal root.
-# - If you're on a splash/landing page (no results), it will try to click "Detailed/Advanced Search" for you.
-# - On the results list, it finds refID links, opens Detail/Printable pages, and extracts fields (incl. ABC price).
-# - Robust ABC parsing (handles "Approved Budget for the Contract:", "Budget (PHP)", "ABC").
-# - Filters OUT construction/civil-works and keeps ONLY Software/IT, Marketing, Events/Photo within Region VI.
-# - Saves philgeps_results_public.csv with ABC and ABC_Numeric (sortable).
+# PhilGEPS public scraper (no login) — portal-tab aware + auto search + auto-pagination.
 #
-# Usage:
-#   1) Run this script. It opens home, then the portal tab.
-#   2) In the portal tab, choose Open Opportunities → Detailed/Advanced Search, set filters, show RESULTS LIST.
-#   3) Press ENTER in Terminal to scrape that page. Click Next → ENTER for more. Type 'q' to finish.
+# Usage (manual, original behaviour):
+#   python philgeps_scrape.py
+#
+# Usage (fully automatic — searches Marketing, IT, Video/Photo, paginates itself):
+#   python philgeps_scrape.py --auto
+#   python philgeps_scrape.py --auto --headless   ← for scheduled/background runs
+#
+# Scheduled daily runs (Mon–Fri 9 AM):
+#   python scheduler.py
 
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 import pandas as pd
-import re, itertools
+import re, argparse
 from urllib.parse import urlparse, parse_qs, urljoin
 from pathlib import Path
 
 # ------------------------------ CONFIG ------------------------------
 
 HOME_URL    = "https://www.philgeps.gov.ph/"
-PORTAL_ROOT = "https://notices.philgeps.gov.ph/"  # neutral root
+PORTAL_ROOT = "https://notices.philgeps.gov.ph/"
 OUT_CSV     = "philgeps_results_public.csv"
 
-DEBUG = True
+DEBUG     = True
+HEADLESS  = False   # overridden by --headless flag
+AUTO_MODE = False   # overridden by --auto flag
+
+MAX_PAGES_PER_KEYWORD = 15  # safety cap on auto-pagination per search term
+
+# One search pass per entry — each is sent to the PhilGEPS keyword field.
+# The existing KEYWORDS/ALLOWED_LOBS filter removes anything unrelated.
+SEARCH_PASSES = [
+    "marketing",
+    "information technology",
+    "software",
+    "video production",
+    "photography",
+    "videography",
+    "digital marketing",
+    "advertising",
+]
+
+# PhilGEPS search/opportunities URLs to try (in order)
+PORTAL_SEARCH_URLS = [
+    "https://notices.philgeps.gov.ph/GEPSNONPILOT/Tender/SplashOpenOpportunitiesUI.aspx",
+    "https://notices.philgeps.gov.ph/GEPSNONPILOT/Tender/OpenDetailedSearchUI.aspx",
+]
 
 # Keep ONLY these business lines
 ALLOWED_LOBS = {"software_it", "marketing", "events_photo"}
@@ -52,7 +74,7 @@ KEYWORDS = {
     ],
 }
 
-# Hard exclusions (category/title contains these -> drop)
+# Hard exclusions
 EXCLUDE_IF_CATEGORY = {
     "construction projects", "civil works",
     "hardware and construction supplies",
@@ -67,7 +89,6 @@ EXCLUDE_IF_TITLE = {
     "basketball", "school building", "building", "improvement"
 }
 
-# Region VI constraint
 REQUIRE_REGION_MATCH = False
 REGION_TOKENS = {
     "`z`", "negros occidental", "capiz", "aklan", "antique", "guimaras",
@@ -81,7 +102,7 @@ def text_clean(s):
 
 def norm_key(k: str) -> str:
     k = text_clean(k).lower()
-    k = re.sub(r"[：:]+$", "", k)  # strip trailing colon(s)
+    k = re.sub(r"[：:]+$", "", k)
     return k
 
 def parse_abc_numeric(abc_str: str):
@@ -96,7 +117,6 @@ def parse_abc_numeric(abc_str: str):
         return None
 
 def match_business_line(title: str, category_or_text: str = "") -> str:
-    """Word/phrase aware matching to reduce false positives like 'water system'."""
     blob = f"{title or ''} | {category_or_text or ''}".lower()
 
     def has_kw(words):
@@ -128,17 +148,7 @@ def extract_title(soup: BeautifulSoup) -> str:
     return ""
 
 def extract_kv_from_tables(soup: BeautifulSoup) -> dict:
-    """
-    Extract label:value pairs from:
-      - 2-col tables (th/td or td/td)
-      - 1-cell 'Label: Value' rows
-      - definition lists (dt/dd)
-    Also store page fulltext for regex fallback and best-effort title.
-    Keys are normalized (lowercased, no trailing colon).
-    """
     info = {}
-
-    # tables: 2-col & 1-col (Label: Value)
     for tbl in soup.find_all("table"):
         for tr in tbl.find_all("tr"):
             cells = tr.find_all(["td", "th"])
@@ -155,8 +165,6 @@ def extract_kv_from_tables(soup: BeautifulSoup) -> dict:
                     v = text_clean(v)
                     if k and v:
                         info[k] = v
-
-    # definition lists
     for dl in soup.find_all("dl"):
         dts, dds = dl.find_all("dt"), dl.find_all("dd")
         for dt, dd in zip(dts, dds):
@@ -164,8 +172,6 @@ def extract_kv_from_tables(soup: BeautifulSoup) -> dict:
             v = text_clean(dd.get_text(" "))
             if k and v:
                 info[k] = v
-
-    # extras
     info["_fulltext"] = soup.get_text(" ", strip=True)
     t = extract_title(soup)
     if t and "title" not in info:
@@ -176,7 +182,6 @@ def info_pick(info: dict, *aliases: str) -> str:
     if not info:
         return ""
     keys = list(info.keys())
-
     for name in aliases:
         n = norm_key(name)
         if n in info:
@@ -184,8 +189,6 @@ def info_pick(info: dict, *aliases: str) -> str:
         for k in keys:
             if n == norm_key(k):
                 return info[k]
-
-    # contains match
     for name in aliases:
         n = norm_key(name)
         for k in keys:
@@ -194,14 +197,11 @@ def info_pick(info: dict, *aliases: str) -> str:
     return ""
 
 def extract_abc_from_info(info: dict) -> str:
-    """Robust ABC extractor: label lookup + regex on full text."""
     if not info:
         return ""
-
     abc = info_pick(info, "approved budget for the contract", "abc", "budget (php)", "budget")
     if abc:
         return text_clean(abc)
-
     full = info.get("_fulltext", "") or ""
     m = re.search(r"Budget\s*\(PHP\)\s*[:\-]?\s*([₱A-Z\s]*[\d][\d,\.]*)", full, re.I)
     if m:
@@ -222,7 +222,6 @@ def absolutize(base_url: str, href: str) -> str:
     return urljoin(base_url.rstrip("/") + "/", href)
 
 def pick_results_tab(ctx):
-    """Prefer the portal/results tab; fallback to the newest tab."""
     pages = ctx.pages
     if not pages:
         return None
@@ -234,7 +233,6 @@ def pick_results_tab(ctx):
     return candidates[-1] if candidates else pages[-1]
 
 def pick_best_node(page):
-    """Some results lists render in a frame; prefer the tender/search frame."""
     try:
         for fr in page.frames[::-1]:
             u = (fr.url or "").lower()
@@ -245,10 +243,6 @@ def pick_best_node(page):
         return page
 
 def ensure_portal_tab(ctx, page):
-    """
-    From home, click the “click Here” link to open the portal in a new tab.
-    If not found, open the neutral portal root.
-    """
     try:
         anchors = page.query_selector_all("a")
         candidate = None
@@ -257,7 +251,6 @@ def ensure_portal_tab(ctx, page):
             if "click" in t and "here" in t:
                 candidate = a
                 break
-
         if candidate:
             try:
                 with page.expect_popup() as pinfo:
@@ -277,18 +270,11 @@ def ensure_portal_tab(ctx, page):
         portal.goto(PORTAL_ROOT, timeout=20000)
         return portal
 
-# ---------------------------------------------------- RESULTS PAGE ASSIST ---------------------------------------------------
-
 def try_enter_detailed_search(ctx, page):
-    """
-    If user is stuck on a splash/landing page, try to click "Detailed" / "Advanced" / "Search" links/buttons.
-    Tries on the page and its frames. Returns True if it thinks it navigated to a results/search page.
-    """
     targets_text = ["Detailed Search", "Advanced Search", "Detailed", "Advanced", "Search"]
     targets_href = ["DetailedSearch", "OpenDetailedSearch", "SearchUI", "Opportunit", "OpenOpp", "OpenOpportun"]
 
     def click_candidates(node):
-        # Try text-locators first (more robust for i18n/labeling)
         for txt in targets_text:
             try:
                 loc = node.locator(f"a:has-text('{txt}')")
@@ -300,7 +286,6 @@ def try_enter_detailed_search(ctx, page):
                         return True
                     except Exception:
                         pass
-
                 locb = node.locator(f"button:has-text('{txt}')")
                 if locb.count() > 0:
                     if DEBUG:
@@ -312,11 +297,9 @@ def try_enter_detailed_search(ctx, page):
                         pass
             except Exception:
                 pass
-
-        # Try href-based anchors
         for a in node.query_selector_all("a"):
             href = a.get_attribute("href") or ""
-            if any(key.lower() in (href.lower()) for key in targets_href):
+            if any(key.lower() in href.lower() for key in targets_href):
                 if DEBUG:
                     print(f"  - Clicking link by href match: {href[:80]}...")
                 try:
@@ -326,7 +309,6 @@ def try_enter_detailed_search(ctx, page):
                     pass
         return False
 
-    # Try in frames (often host the UI)
     try:
         for fr in page.frames[::-1]:
             if click_candidates(fr):
@@ -334,8 +316,6 @@ def try_enter_detailed_search(ctx, page):
                 return True
     except Exception:
         pass
-
-    # Try on the page itself
     try:
         if click_candidates(page):
             page.wait_for_load_state("domcontentloaded", timeout=5000)
@@ -343,8 +323,6 @@ def try_enter_detailed_search(ctx, page):
             return True
     except Exception:
         pass
-
-    # As a last resort, open portal root (user can navigate to search from there)
     try:
         if DEBUG:
             print("  - Opening neutral portal root as fallback.")
@@ -366,7 +344,6 @@ def extract_refid_from_string(s: str) -> str:
     return m.group(1) if m else ""
 
 def make_detail_urls(base_like: str, refid: str):
-    """Create BOTH detail + printable URLs on the SAME host as the link."""
     if not refid:
         return []
     parsed = urlparse(base_like or PORTAL_ROOT)
@@ -377,25 +354,20 @@ def make_detail_urls(base_like: str, refid: str):
     ]
 
 def scrape_detail_info(ctx, url: str) -> dict:
-    """Load a detail URL and extract fields. Return {} if not useful."""
     try:
         pg = ctx.new_page()
         pg.goto(url, timeout=30000, wait_until="domcontentloaded")
-        pg.wait_for_timeout(700)  # small settle
+        pg.wait_for_timeout(700)
         html = pg.content()
         pg.close()
-
         soup = BeautifulSoup(html, "lxml")
         info = extract_kv_from_tables(soup)
-
-        # valid if we got some useful bits or at least _fulltext for regex fallback
         valid_keys = {"approved budget for the contract", "abc", "procuring entity", "area of delivery"}
         return info if any(k in info for k in valid_keys) or info.get("_fulltext") else {}
     except Exception:
         return {}
 
 def wait_for_results(node, timeout_ms=6000):
-    """Best-effort wait for either refID links or obvious row containers."""
     try:
         node.wait_for_selector("a[href*='refID'], a[href*='refid'], a[href*='BidNoticeAbstract']", timeout=timeout_ms)
         return True
@@ -407,7 +379,6 @@ def wait_for_results(node, timeout_ms=6000):
             return False
 
 def find_refid_result_links(node) -> list:
-    """Collect anchors that contain refID (or routes that include it)."""
     links, seen = [], set()
     selectors = [
         "a[href*='refID']", "a[href*='refid']",
@@ -427,15 +398,7 @@ def find_refid_result_links(node) -> list:
     return links
 
 def gather_from_results_public(ctx, page) -> list:
-    """
-    1) Ensure we're on a results list (if splash, try auto "Detailed/Advanced Search").
-    2) Grab refID-bearing links.
-    3) For each, try Detail then Printable pages to extract fields.
-    4) FILTER rows to only keep allowed business lines & Region VI, excluding construction-ish.
-    """
     node = pick_best_node(page)
-
-    # If we don't see results yet, try to auto-enter detailed/advanced search
     if not wait_for_results(node, timeout_ms=3000):
         if DEBUG:
             print("  (Results not detected — attempting to open Detailed/Advanced Search...)")
@@ -457,7 +420,6 @@ def gather_from_results_public(ctx, page) -> list:
 
     items = []
     for href_full in candidates:
-        # Extract refID (also check DirectFrom param)
         refid = extract_refid_from_string(href_full)
         if not refid:
             try:
@@ -476,7 +438,6 @@ def gather_from_results_public(ctx, page) -> list:
                 detail_used = u
                 break
 
-        # Core fields
         project = info.get("procurement project", "") or info.get("title", "")
         entity = info.get("procuring entity", "")
         classification = info.get("classification", "")
@@ -485,29 +446,14 @@ def gather_from_results_public(ctx, page) -> list:
         abc = extract_abc_from_info(info)
         area = info.get("area of delivery", "")
 
-        # Posting / Date Published
-        posting = info_pick(
-            info,
-            "posting date",
-            "date published",
-            "date issued",
-            "date posted"
-        )
-
-        # Closing / Deadline
+        posting = info_pick(info, "posting date", "date published", "date issued", "date posted")
         closing = info_pick(
             info,
-            "closing date",
-            "closing date / time",
-            "closing date/time",
-            "closing date & time",
-            "deadline of submission",
-            "closing date and time"
+            "closing date", "closing date / time", "closing date/time",
+            "closing date & time", "deadline of submission", "closing date and time"
         )
-
         refno = info.get("reference number", "") or info.get("solicitation number", "") or (refid or "")
 
-        # ---------- FILTERING ----------
         lob = match_business_line(project, category or "")
         if lob not in ALLOWED_LOBS:
             continue
@@ -522,7 +468,6 @@ def gather_from_results_public(ctx, page) -> list:
 
         if REQUIRE_REGION_MATCH and not in_region_text(area, entity, project):
             continue
-        # --------------------------------
 
         items.append({
             "Project/Title": text_clean(project),
@@ -543,12 +488,289 @@ def gather_from_results_public(ctx, page) -> list:
 
     return items
 
-# ------------------------------ MAIN ------------------------------
+# ----------------------- AUTO MODE HELPERS -----------------------
 
-def main():
-    print("\n=== PhilGEPS Public Scraper (portal-tab aware + auto Detailed Search + ABC) ===")
-    print("In the portal tab, open Open Opportunities → Detailed/Advanced Search, set filters, show RESULTS.")
-    print("Then press ENTER here. Click Next in the browser → ENTER again. Type 'q' to finish.\n")
+def navigate_and_search(ctx, keyword: str):
+    """
+    Open a fresh page, navigate to PhilGEPS Open Opportunities, fill the
+    keyword/title field with `keyword`, and submit. Returns the results page
+    or None on failure.
+    """
+    page = ctx.new_page()
+    try:
+        # Try each search URL until one loads
+        loaded = False
+        for url in PORTAL_SEARCH_URLS:
+            try:
+                page.goto(url, timeout=25000, wait_until="domcontentloaded")
+                page.wait_for_timeout(1500)
+                loaded = True
+                break
+            except Exception:
+                continue
+
+        if not loaded:
+            page.goto(PORTAL_ROOT, timeout=20000, wait_until="domcontentloaded")
+            page.wait_for_timeout(1500)
+
+        # If we're on a splash/landing, click into Detailed/Advanced Search
+        if not wait_for_results(pick_best_node(page), timeout_ms=1500):
+            try_enter_detailed_search(ctx, page)
+            page.wait_for_timeout(1000)
+
+        # Try to fill the title/keyword search field
+        field_selectors = [
+            "input[name*='Title']",
+            "input[name*='title']",
+            "input[name*='Keyword']",
+            "input[name*='keyword']",
+            "input[id*='Title']",
+            "input[id*='title']",
+            "input[id*='Keyword']",
+            "input[placeholder*='title']",
+            "input[placeholder*='keyword']",
+            "input[placeholder*='Title']",
+        ]
+
+        filled = False
+        # Try on the page and its frames
+        nodes = [page] + list(reversed(page.frames))
+        for node in nodes:
+            if filled:
+                break
+            for sel in field_selectors:
+                try:
+                    loc = node.locator(sel)
+                    if loc.count() > 0:
+                        loc.first.clear()
+                        loc.first.fill(keyword)
+                        filled = True
+                        if DEBUG:
+                            print(f"  Filled '{keyword}' → {sel}")
+                        break
+                except Exception:
+                    pass
+
+        if not filled:
+            # Fallback: first visible text input
+            for node in nodes:
+                try:
+                    inputs = node.locator("input[type='text']:visible")
+                    if inputs.count() > 0:
+                        inputs.first.clear()
+                        inputs.first.fill(keyword)
+                        filled = True
+                        if DEBUG:
+                            print(f"  Filled '{keyword}' → first visible text input")
+                        break
+                except Exception:
+                    pass
+
+        if not filled:
+            if DEBUG:
+                print(f"  WARNING: could not find search field for '{keyword}'. Trying to scrape current page anyway.")
+
+        # Click Search / Submit button
+        btn_selectors = [
+            "input[value='Search']",
+            "input[value='search']",
+            "input[value='SEARCH']",
+            "button:has-text('Search')",
+            "a:has-text('Search')",
+            "input[type='submit']",
+            "button[type='submit']",
+        ]
+        for node in nodes:
+            clicked = False
+            for sel in btn_selectors:
+                try:
+                    btn = node.locator(sel)
+                    if btn.count() > 0:
+                        btn.first.click(timeout=5000)
+                        clicked = True
+                        break
+                except Exception:
+                    pass
+            if clicked:
+                break
+
+        page.wait_for_load_state("domcontentloaded", timeout=20000)
+        page.wait_for_timeout(1200)
+        return page
+
+    except Exception as e:
+        if DEBUG:
+            print(f"  Error in navigate_and_search('{keyword}'): {e}")
+        try:
+            page.close()
+        except Exception:
+            pass
+        return None
+
+
+def click_next_page(page) -> bool:
+    """
+    Click the Next page button/link in the results grid.
+    Handles ASP.NET GridView __doPostBack pagination and plain "Next"/">" links.
+    Returns True if a Next link was found and clicked.
+    """
+    next_selectors = [
+        "a:has-text('Next')",
+        "a:has-text('>')",
+        "a:has-text('»')",
+        "input[value='Next']",
+        "input[value='>']",
+        "a[href*='Page$Next']",
+        "a[href*='Page%24Next']",
+    ]
+
+    nodes = [page] + list(reversed(page.frames))
+    for node in nodes:
+        for sel in next_selectors:
+            try:
+                loc = node.locator(sel)
+                if loc.count() == 0:
+                    continue
+                # Skip if the element is inside a <span> (disabled current-page indicator)
+                tag = loc.first.evaluate("el => el.tagName.toLowerCase()")
+                if tag == "a":
+                    loc.first.click(timeout=5000)
+                    return True
+                elif tag == "input":
+                    loc.first.click(timeout=5000)
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def scrape_all_pages(ctx, page, keyword: str) -> list:
+    """Scrape all result pages for a single keyword search, auto-paginating."""
+    all_items = []
+    for page_num in range(1, MAX_PAGES_PER_KEYWORD + 1):
+        if DEBUG:
+            print(f"  ['{keyword}'] page {page_num}...")
+
+        node = pick_best_node(page)
+        if not wait_for_results(node, timeout_ms=8000):
+            if DEBUG:
+                print(f"  No results detected on page {page_num}.")
+            break
+
+        items = gather_from_results_public(ctx, page)
+        all_items.extend(items)
+        if DEBUG:
+            print(f"  Page {page_num}: {len(items)} matching item(s) kept.")
+
+        if not click_next_page(page):
+            if DEBUG:
+                print(f"  No Next page — done with '{keyword}'.")
+            break
+
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
+        page.wait_for_timeout(900)
+
+    return all_items
+
+
+def save_results(rows: list, append: bool = False):
+    """Save rows to CSV. If append=True, merges with existing file and deduplicates."""
+    COLS = [
+        "Project/Title", "Procuring Entity", "Classification", "Category",
+        "Procurement Mode", "ABC", "ABC_Numeric", "Area of Delivery", "Posting Date",
+        "Closing/Deadline", "Reference/Solicitation No.", "Business Line",
+        "URL", "Detail URL Used",
+    ]
+
+    new_df = pd.DataFrame(rows, columns=COLS) if rows else pd.DataFrame(columns=COLS)
+
+    if append and Path(OUT_CSV).exists():
+        try:
+            existing_df = pd.read_csv(OUT_CSV)
+            combined = pd.concat([existing_df, new_df], ignore_index=True)
+            combined.drop_duplicates(subset=["Reference/Solicitation No."], keep="first", inplace=True)
+            combined.to_csv(OUT_CSV, index=False)
+            print(f"CSV updated: {len(combined)} total rows in {OUT_CSV} ({len(new_df)} new).")
+            return
+        except Exception as e:
+            if DEBUG:
+                print(f"  Could not merge with existing CSV ({e}). Overwriting.")
+
+    if not new_df.empty:
+        new_df.drop_duplicates(inplace=True)
+    new_df.to_csv(OUT_CSV, index=False)
+    print(f"Saved {len(new_df)} rows to {OUT_CSV}")
+
+
+# ----------------------------- MODES -----------------------------
+
+def auto_run():
+    """
+    Fully automated mode: for each keyword in SEARCH_PASSES, navigate to PhilGEPS,
+    fill the search form, scrape all result pages, then save/append to CSV.
+    """
+    print("\n=== PhilGEPS Auto Scraper ===")
+    print(f"Search passes : {SEARCH_PASSES}")
+    print(f"Headless      : {HEADLESS}")
+    print(f"Max pages/kw  : {MAX_PAGES_PER_KEYWORD}\n")
+
+    # Pre-load existing reference numbers to skip duplicates
+    existing_refs: set = set()
+    if Path(OUT_CSV).exists():
+        try:
+            existing_df = pd.read_csv(OUT_CSV)
+            existing_refs = set(existing_df["Reference/Solicitation No."].dropna().astype(str))
+            print(f"Loaded {len(existing_refs)} existing reference numbers from {OUT_CSV}\n")
+        except Exception:
+            pass
+
+    all_new_rows = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=HEADLESS)
+        ctx = browser.new_context()
+
+        for keyword in SEARCH_PASSES:
+            print(f"\n--- Keyword: '{keyword}' ---")
+            search_page = navigate_and_search(ctx, keyword)
+            if not search_page:
+                print(f"  Skipping '{keyword}' (navigation failed).")
+                continue
+
+            items = scrape_all_pages(ctx, search_page, keyword)
+
+            try:
+                search_page.close()
+            except Exception:
+                pass
+
+            # Drop items already in the CSV
+            new_items = [
+                item for item in items
+                if str(item.get("Reference/Solicitation No.", "")) not in existing_refs
+            ]
+            for item in new_items:
+                ref = str(item.get("Reference/Solicitation No.", ""))
+                if ref:
+                    existing_refs.add(ref)
+
+            all_new_rows.extend(new_items)
+            print(f"  Kept {len(new_items)} new item(s) "
+                  f"(skipped {len(items) - len(new_items)} duplicate(s)).")
+
+        browser.close()
+
+    print(f"\nTotal new rows this run: {len(all_new_rows)}")
+    save_results(all_new_rows, append=True)
+    return all_new_rows
+
+
+def manual_run():
+    """Original manual mode — user sets up filters in the browser, presses ENTER to scrape."""
+    print("\n=== PhilGEPS Public Scraper (manual mode) ===")
+    print("In the portal tab, open Open Opportunities → Detailed/Advanced Search,")
+    print("set your filters, then press ENTER here to scrape.")
+    print("Click Next in the browser → ENTER again. Type 'q' to finish.\n")
 
     rows = []
     with sync_playwright() as p:
@@ -557,7 +779,6 @@ def main():
         home = ctx.new_page()
         home.goto(HOME_URL, timeout=20000)
 
-        # Open portal tab (new tab via 'click Here', or neutral root fallback)
         portal = ensure_portal_tab(ctx, home)
         print(f"Portal tab: {portal.url}")
 
@@ -585,25 +806,42 @@ def main():
 
         browser.close()
 
-    # Save output (always create file)
-    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=[
-        "Project/Title", "Procuring Entity", "Classification", "Category",
-        "Procurement Mode", "ABC", "ABC_Numeric", "Area of Delivery", "Posting Date",
-        "Closing/Deadline", "Reference/Solicitation No.", "Business Line",
-        "URL", "Detail URL Used"
-    ])
+    save_results(rows, append=False)
 
-    if not df.empty:
-        df.drop_duplicates(inplace=True)
+    if not rows:
+        print("Note: If the CSV is empty, you were likely on a splash/landing view.")
+        print("Enter Detailed/Advanced Search, run a query, ensure the list shows rows, then press ENTER.")
 
-    Path(OUT_CSV).write_text("")
-    df.to_csv(OUT_CSV, index=False)
 
-    print(f"\n📝 Saved {len(df)} rows to {OUT_CSV}")
-    if df.empty:
-        print("Note: If this is empty, you were likely still on a splash/landing view. Enter Detailed/Advanced Search, run")
-        print("      a query (Region VI + keywords), ensure the list shows multiple rows with links, then press ENTER again.")
+# ------------------------------ MAIN ------------------------------
+
+def main():
+    global AUTO_MODE, HEADLESS
+
+    parser = argparse.ArgumentParser(
+        description="PhilGEPS scraper — manual or fully automatic.",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "--auto", action="store_true",
+        help="Automatically search for Marketing/IT/Video-Photo categories and paginate."
+    )
+    parser.add_argument(
+        "--headless", action="store_true",
+        help="Run the browser in headless mode (required for scheduled/background runs)."
+    )
+    args = parser.parse_args()
+
+    if args.auto:
+        AUTO_MODE = True
+    if args.headless:
+        HEADLESS = True
+
+    if AUTO_MODE:
+        auto_run()
+    else:
+        manual_run()
+
 
 if __name__ == "__main__":
     main()
-
