@@ -11,6 +11,10 @@
 #
 # Scheduled daily runs (Mon–Fri 9 AM):
 #   python scheduler.py
+#
+# Google Sheets auto-upload:
+#   Place your service account credentials.json in this folder.
+#   See README or setup instructions for how to create one.
 
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
@@ -28,6 +32,12 @@ OUT_CSV     = "philgeps_results_public.csv"
 DEBUG     = True
 HEADLESS  = False   # overridden by --headless flag
 AUTO_MODE = False   # overridden by --auto flag
+
+# Google Sheets — set SHEETS_ID and place credentials.json in this folder.
+# Upload is skipped automatically if credentials.json is missing.
+SHEETS_ID        = "125IzvCRhurd6qgG8B0TZP7crfR40pZGCPLtB0x2CxRM"
+CREDENTIALS_FILE = Path(__file__).parent / "credentials.json"
+SHEET_TAB_NAME   = "Sheet1"   # change if your tab has a different name
 
 MAX_PAGES_PER_KEYWORD = 15  # safety cap on auto-pagination per search term
 
@@ -673,8 +683,46 @@ def scrape_all_pages(ctx, page, keyword: str) -> list:
     return all_items
 
 
+def upload_to_sheets(df: pd.DataFrame):
+    """Push the full DataFrame to Google Sheets, replacing existing content."""
+    if not CREDENTIALS_FILE.exists():
+        if DEBUG:
+            print("  credentials.json not found — skipping Google Sheets upload.")
+        return
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_file(str(CREDENTIALS_FILE), scopes=scopes)
+        client = gspread.authorize(creds)
+        sheet = client.open_by_key(SHEETS_ID)
+
+        try:
+            worksheet = sheet.worksheet(SHEET_TAB_NAME)
+        except gspread.exceptions.WorksheetNotFound:
+            worksheet = sheet.sheet1
+
+        worksheet.clear()
+
+        # Replace NaN with empty string so Sheets doesn't receive "nan"
+        clean_df = df.fillna("")
+        data = [clean_df.columns.tolist()] + clean_df.values.tolist()
+        worksheet.update(data, value_input_option="USER_ENTERED")
+
+        print(f"Google Sheets updated: {len(df)} rows → {SHEETS_ID}")
+
+    except ImportError:
+        print("  gspread not installed. Run: pip install gspread google-auth")
+    except Exception as e:
+        print(f"  Google Sheets upload failed: {e}")
+
+
 def save_results(rows: list, append: bool = False):
-    """Save rows to CSV. If append=True, merges with existing file and deduplicates."""
+    """Save rows to CSV and sync to Google Sheets."""
     COLS = [
         "Project/Title", "Procuring Entity", "Classification", "Category",
         "Procurement Mode", "ABC", "ABC_Numeric", "Area of Delivery", "Posting Date",
@@ -691,6 +739,7 @@ def save_results(rows: list, append: bool = False):
             combined.drop_duplicates(subset=["Reference/Solicitation No."], keep="first", inplace=True)
             combined.to_csv(OUT_CSV, index=False)
             print(f"CSV updated: {len(combined)} total rows in {OUT_CSV} ({len(new_df)} new).")
+            upload_to_sheets(combined)
             return
         except Exception as e:
             if DEBUG:
@@ -700,6 +749,7 @@ def save_results(rows: list, append: bool = False):
         new_df.drop_duplicates(inplace=True)
     new_df.to_csv(OUT_CSV, index=False)
     print(f"Saved {len(new_df)} rows to {OUT_CSV}")
+    upload_to_sheets(new_df)
 
 
 # ----------------------------- MODES -----------------------------
