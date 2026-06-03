@@ -1,0 +1,39 @@
+name: PhilGEPS Daily Scrape
+
+on:
+  schedule:
+    - cron: '0 1 * * 1-5'  # 9:00 AM Philippine Time (UTC+8), Mon–Fri
+  workflow_dispatch:        # lets you trigger it manually from GitHub too
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install playwright beautifulsoup4 pandas lxml gspread google-auth
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Write Google credentials
+        run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
+
+      - name: Run scraper
+        run: python philgeps_scrape.py --auto --headless
+
+      - name: Commit updated CSV
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add philgeps_results_public.csv
+          git diff --staged --quiet || git commit -m "chore: update scraped results $(date -u '+%Y-%m-%d')"
+          git push
