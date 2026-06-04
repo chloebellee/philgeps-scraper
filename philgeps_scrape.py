@@ -41,23 +41,27 @@ SHEET_TAB_NAME   = "Sheet1"   # change if your tab has a different name
 
 MAX_PAGES_PER_KEYWORD = 15  # safety cap on auto-pagination per search term
 
-# One search pass per entry — each is sent to the PhilGEPS keyword field.
-# The existing KEYWORDS/ALLOWED_LOBS filter removes anything unrelated.
-SEARCH_PASSES = [
-    "marketing",
-    "information technology",
-    "software",
-    "video production",
-    "photography",
-    "videography",
-    "digital marketing",
-    "advertising",
-]
+# PhilGEPS Open Opportunities page (ClickFrom param required — direct access errors without it)
+OPPS_URL = "https://notices.philgeps.gov.ph/GEPSNONPILOT/Tender/SplashOpenOpportunitiesUI.aspx?ClickFrom=OpenOpp&menuIndex=3"
 
-# PhilGEPS search/opportunities URLs to try (in order)
-PORTAL_SEARCH_URLS = [
-    "https://notices.philgeps.gov.ph/GEPSNONPILOT/Tender/SplashOpenOpportunitiesUI.aspx",
-    "https://notices.philgeps.gov.ph/GEPSNONPILOT/Tender/OpenDetailedSearchUI.aspx",
+# PhilGEPS category IDs to scrape — one search pass per entry.
+# The existing KEYWORDS/ALLOWED_LOBS filter still removes anything unrelated.
+CATEGORY_PASSES = [
+    # Marketing & Advertising
+    ("157", "Advertising Agency Services"),
+    ("64",  "Editorial, Design, Graphic and Fine Art Services"),
+    ("159", "Market Research Services"),
+    ("144", "Print and Broadcast and Aerial Advertising"),
+    ("158", "Public Relations Programs or Services"),
+    # IT & Software
+    ("10",  "Information Technology"),
+    ("86",  "Internet Services"),
+    ("108", "Systems Integration"),
+    ("167", "IT Broadcasting and Telecommunications"),
+    # Video & Photography
+    ("127", "Video Production Services"),
+    ("168", "Photography Services"),
+    ("156", "Events Management"),
 ]
 
 # Keep ONLY these business lines
@@ -500,117 +504,46 @@ def gather_from_results_public(ctx, page) -> list:
 
 # ----------------------- AUTO MODE HELPERS -----------------------
 
-def navigate_and_search(ctx, keyword: str):
+def navigate_and_search(ctx, cat_id: str, cat_name: str):
     """
-    Open a fresh page, navigate to PhilGEPS Open Opportunities, fill the
-    keyword/title field with `keyword`, and submit. Returns the results page
-    or None on failure.
+    Navigate to PhilGEPS Detailed Search, select `cat_id` from the category
+    dropdown, and submit. Returns the results page or None on failure.
     """
     page = ctx.new_page()
     try:
-        # Try each search URL until one loads
-        loaded = False
-        for url in PORTAL_SEARCH_URLS:
-            try:
-                page.goto(url, timeout=25000, wait_until="domcontentloaded")
-                page.wait_for_timeout(1500)
-                loaded = True
-                break
-            except Exception:
-                continue
+        page.goto(OPPS_URL, timeout=30000, wait_until="domcontentloaded",
+                  referer="https://notices.philgeps.gov.ph/")
+        page.wait_for_timeout(2000)
 
-        if not loaded:
-            page.goto(PORTAL_ROOT, timeout=20000, wait_until="domcontentloaded")
-            page.wait_for_timeout(1500)
+        # Click "Detailed Search" via ASP.NET postback
+        page.evaluate("__doPostBack('lbtnDetailed','')")
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
+        page.wait_for_timeout(2000)
 
-        # If we're on a splash/landing, click into Detailed/Advanced Search
-        if not wait_for_results(pick_best_node(page), timeout_ms=1500):
-            try_enter_detailed_search(ctx, page)
-            page.wait_for_timeout(1000)
+        if DEBUG:
+            print(f"  Detailed Search form: {page.url}")
 
-        # Try to fill the title/keyword search field
-        field_selectors = [
-            "input[name*='Title']",
-            "input[name*='title']",
-            "input[name*='Keyword']",
-            "input[name*='keyword']",
-            "input[id*='Title']",
-            "input[id*='title']",
-            "input[id*='Keyword']",
-            "input[placeholder*='title']",
-            "input[placeholder*='keyword']",
-            "input[placeholder*='Title']",
-        ]
+        # Select the category from the dropdown
+        page.select_option("select[name='lstCategory']", value=cat_id)
+        if DEBUG:
+            print(f"  Selected category {cat_id} ({cat_name})")
 
-        filled = False
-        # Try on the page and its frames
-        nodes = [page] + list(reversed(page.frames))
-        for node in nodes:
-            if filled:
-                break
-            for sel in field_selectors:
-                try:
-                    loc = node.locator(sel)
-                    if loc.count() > 0:
-                        loc.first.clear()
-                        loc.first.fill(keyword)
-                        filled = True
-                        if DEBUG:
-                            print(f"  Filled '{keyword}' → {sel}")
-                        break
-                except Exception:
-                    pass
+        # Click the Search button via JS — avoids Playwright's navigation-wait timeout
+        page.evaluate("document.getElementById('btnSearch').click()")
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=45000)
+        except Exception:
+            pass
+        page.wait_for_timeout(3000)
 
-        if not filled:
-            # Fallback: first visible text input
-            for node in nodes:
-                try:
-                    inputs = node.locator("input[type='text']:visible")
-                    if inputs.count() > 0:
-                        inputs.first.clear()
-                        inputs.first.fill(keyword)
-                        filled = True
-                        if DEBUG:
-                            print(f"  Filled '{keyword}' → first visible text input")
-                        break
-                except Exception:
-                    pass
+        if DEBUG:
+            print(f"  Results page: {page.url}")
 
-        if not filled:
-            if DEBUG:
-                print(f"  WARNING: could not find search field for '{keyword}'. Trying to scrape current page anyway.")
-
-        # Click Search / Submit button
-        btn_selectors = [
-            "input[value='Search']",
-            "input[value='search']",
-            "input[value='SEARCH']",
-            "button:has-text('Search')",
-            "a:has-text('Search')",
-            "input[type='submit']",
-            "button[type='submit']",
-        ]
-        for node in nodes:
-            clicked = False
-            for sel in btn_selectors:
-                try:
-                    btn = node.locator(sel)
-                    if btn.count() > 0:
-                        btn.first.click(timeout=5000)
-                        clicked = True
-                        break
-                except Exception:
-                    pass
-            if clicked:
-                break
-
-        page.wait_for_load_state("domcontentloaded", timeout=20000)
-        page.wait_for_timeout(1200)
         return page
 
     except Exception as e:
         if DEBUG:
-            print(f"  Error in navigate_and_search('{keyword}'): {e}")
+            print(f"  Error navigating to category '{cat_name}': {e}")
         try:
             page.close()
         except Exception:
@@ -620,18 +553,18 @@ def navigate_and_search(ctx, keyword: str):
 
 def click_next_page(page) -> bool:
     """
-    Click the Next page button/link in the results grid.
-    Handles ASP.NET GridView __doPostBack pagination and plain "Next"/">" links.
-    Returns True if a Next link was found and clicked.
+    Click the <Next> pagination link on PhilGEPS results.
+    Uses the known ASP.NET postback target pgCtrlOpp$nextLB.
+    Returns True if found and clicked.
     """
+    # Try the known postback link text first
     next_selectors = [
+        "a:has-text('<Next>')",
         "a:has-text('Next')",
         "a:has-text('>')",
         "a:has-text('»')",
         "input[value='Next']",
         "input[value='>']",
-        "a[href*='Page$Next']",
-        "a[href*='Page%24Next']",
     ]
 
     nodes = [page] + list(reversed(page.frames))
@@ -756,13 +689,13 @@ def save_results(rows: list, append: bool = False):
 
 def auto_run():
     """
-    Fully automated mode: for each keyword in SEARCH_PASSES, navigate to PhilGEPS,
-    fill the search form, scrape all result pages, then save/append to CSV.
+    Fully automated mode: for each category in CATEGORY_PASSES, navigate to PhilGEPS
+    Detailed Search, select the category, scrape all result pages, save/append to CSV.
     """
     print("\n=== PhilGEPS Auto Scraper ===")
-    print(f"Search passes : {SEARCH_PASSES}")
+    print(f"Categories    : {len(CATEGORY_PASSES)} passes")
     print(f"Headless      : {HEADLESS}")
-    print(f"Max pages/kw  : {MAX_PAGES_PER_KEYWORD}\n")
+    print(f"Max pages/cat : {MAX_PAGES_PER_KEYWORD}\n")
 
     # Pre-load existing reference numbers to skip duplicates
     existing_refs: set = set()
@@ -780,14 +713,14 @@ def auto_run():
         browser = p.chromium.launch(headless=HEADLESS)
         ctx = browser.new_context()
 
-        for keyword in SEARCH_PASSES:
-            print(f"\n--- Keyword: '{keyword}' ---")
-            search_page = navigate_and_search(ctx, keyword)
+        for cat_id, cat_name in CATEGORY_PASSES:
+            print(f"\n--- Category: '{cat_name}' (id={cat_id}) ---")
+            search_page = navigate_and_search(ctx, cat_id, cat_name)
             if not search_page:
-                print(f"  Skipping '{keyword}' (navigation failed).")
+                print(f"  Skipping (navigation failed).")
                 continue
 
-            items = scrape_all_pages(ctx, search_page, keyword)
+            items = scrape_all_pages(ctx, search_page, cat_name)
 
             try:
                 search_page.close()
