@@ -617,14 +617,18 @@ def scrape_all_pages(ctx, page, keyword: str) -> list:
 
 
 def upload_to_sheets(df: pd.DataFrame):
-    """Push the full DataFrame to Google Sheets, replacing existing content."""
+    """Upload today's new rows to a date-named tab (e.g. 'June 4'). Creates the tab if needed."""
     if not CREDENTIALS_FILE.exists():
         if DEBUG:
             print("  credentials.json not found — skipping Google Sheets upload.")
         return
+    if df.empty:
+        print("  No new rows to upload to Google Sheets.")
+        return
     try:
         import gspread
         from google.oauth2.service_account import Credentials
+        from datetime import date
 
         scopes = [
             "https://www.googleapis.com/auth/spreadsheets",
@@ -634,19 +638,25 @@ def upload_to_sheets(df: pd.DataFrame):
         client = gspread.authorize(creds)
         sheet = client.open_by_key(SHEETS_ID)
 
+        # Tab name = today's date, e.g. "June 4"
+        tab_name = date.today().strftime("%-m/%d").lstrip("0")
+        tab_name = date.today().strftime("%B %-d")  # "June 4"
+
         try:
-            worksheet = sheet.worksheet(SHEET_TAB_NAME)
+            worksheet = sheet.worksheet(tab_name)
+            worksheet.clear()
+            print(f"  Cleared existing tab '{tab_name}'.")
         except gspread.exceptions.WorksheetNotFound:
-            worksheet = sheet.sheet1
+            worksheet = sheet.add_worksheet(title=tab_name, rows=500, cols=20)
+            # Move the new tab to the front so it's easy to find
+            sheet.reorder_worksheets([worksheet] + [ws for ws in sheet.worksheets() if ws.title != tab_name])
+            print(f"  Created new tab '{tab_name}'.")
 
-        worksheet.clear()
-
-        # Replace NaN with empty string so Sheets doesn't receive "nan"
         clean_df = df.fillna("")
         data = [clean_df.columns.tolist()] + clean_df.values.tolist()
         worksheet.update(data, value_input_option="USER_ENTERED")
 
-        print(f"Google Sheets updated: {len(df)} rows → {SHEETS_ID}")
+        print(f"Google Sheets → tab '{tab_name}': {len(df)} new rows uploaded.")
 
     except ImportError:
         print("  gspread not installed. Run: pip install gspread google-auth")
@@ -672,7 +682,7 @@ def save_results(rows: list, append: bool = False):
             combined.drop_duplicates(subset=["Reference/Solicitation No."], keep="first", inplace=True)
             combined.to_csv(OUT_CSV, index=False)
             print(f"CSV updated: {len(combined)} total rows in {OUT_CSV} ({len(new_df)} new).")
-            upload_to_sheets(combined)
+            upload_to_sheets(new_df)  # only today's new rows go to the date tab
             return
         except Exception as e:
             if DEBUG:
