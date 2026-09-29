@@ -20,15 +20,18 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install playwright beautifulsoup4 pandas lxml gspread google-auth
+          pip install playwright beautifulsoup4 pandas lxml gspread google-auth requests
           playwright install chromium
           playwright install-deps chromium
 
       - name: Write Google credentials
         run: echo '${{ secrets.GOOGLE_CREDENTIALS }}' > credentials.json
 
-      - name: Run scraper
+      - name: Run scraper (notices.philgeps.gov.ph)
         run: python philgeps_scrape.py --auto --headless
+
+      - name: Run scraper (ps-philgeps.gov.ph)
+        run: python ps_philgeps_scrape.py
 
       - name: Commit updated CSV
         run: |
