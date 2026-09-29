@@ -79,7 +79,10 @@ KEYWORDS = {
     "marketing": [
         "marketing", "branding", "campaign", "social media", "digital marketing",
         "content", "media placement", "ads", "advertising", "collateral",
-        "public relations", "pr"
+        "public relations"
+        # NOTE: bare "pr" was removed -- it collided with "PR No. ..." / "PR-XXXX",
+        # the ubiquitous Purchase Request reference number in PH gov't titles,
+        # pulling in laptops, Office 365 licenses, etc. as false "marketing" hits.
     ],
     "events_photo": [
         "event coverage", "photo coverage", "photography", "videography",
@@ -130,8 +133,19 @@ def parse_abc_numeric(abc_str: str):
     except Exception:
         return None
 
+# PhilGEPS categories whose own label text must NOT be enough, by itself, to
+# satisfy a keyword match. "Public Relations Programs or Services" is used by
+# procuring entities as a catch-all for unrelated small-value LGU purchases
+# (rice, chairs, tents, seminars...), so its label alone auto-matching the
+# "public relations" keyword let all of that through regardless of content.
+CATEGORY_SELF_MATCH_EXCLUDE = {"public relations programs or services"}
+
+
 def match_business_line(title: str, category_or_text: str = "") -> str:
-    blob = f"{title or ''} | {category_or_text or ''}".lower()
+    cat = category_or_text or ""
+    if cat.strip().lower() in CATEGORY_SELF_MATCH_EXCLUDE:
+        cat = ""
+    blob = f"{title or ''} | {cat}".lower()
 
     def has_kw(words):
         for w in words:
