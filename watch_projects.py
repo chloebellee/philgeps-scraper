@@ -150,7 +150,8 @@ def add_to_main_data(rows):
             "https://www.googleapis.com/auth/drive"])
         sheet = gspread.authorize(creds).open_by_key(SHEETS_ID)
         tab = date.today().strftime("%B %-d")
-        cols = list(rows[0].keys())
+        cols = list(rows[0].keys()) + ["New?"]
+        rows = [{**r, "New?": "Yes"} for r in rows]
         try:
             ws = sheet.worksheet(tab)
         except gspread.exceptions.WorksheetNotFound:

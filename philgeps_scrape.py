@@ -678,8 +678,12 @@ def upload_to_sheets(df: pd.DataFrame):
         print(f"  Google Sheets upload failed: {e}")
 
 
-def save_results(rows: list, append: bool = False):
-    """Save rows to CSV and sync to Google Sheets."""
+def save_results(rows: list, append: bool = False, sheet_rows: list = None):
+    """Save rows to CSV and sync to Google Sheets.
+
+    rows go to the CSV (de-duplicated). sheet_rows, when given, is what goes to the
+    date tab instead of rows (a full snapshot of every open matching notice).
+    """
     COLS = [
         "Project/Title", "Procuring Entity", "Classification", "Category",
         "Procurement Mode", "ABC", "ABC_Numeric", "Area of Delivery", "Posting Date",
@@ -688,6 +692,9 @@ def save_results(rows: list, append: bool = False):
     ]
 
     new_df = pd.DataFrame(rows, columns=COLS) if rows else pd.DataFrame(columns=COLS)
+    sheet_df = new_df
+    if sheet_rows is not None:
+        sheet_df = pd.DataFrame(sheet_rows, columns=COLS + ["New?"]) if sheet_rows else pd.DataFrame(columns=COLS + ["New?"])
 
     if append and Path(OUT_CSV).exists():
         try:
@@ -696,7 +703,7 @@ def save_results(rows: list, append: bool = False):
             combined.drop_duplicates(subset=["Reference/Solicitation No."], keep="first", inplace=True)
             combined.to_csv(OUT_CSV, index=False)
             print(f"CSV updated: {len(combined)} total rows in {OUT_CSV} ({len(new_df)} new).")
-            upload_to_sheets(new_df)  # only today's new rows go to the date tab
+            upload_to_sheets(sheet_df)  # date tab: every open matching notice, flagged New?
             return
         except Exception as e:
             if DEBUG:
@@ -706,7 +713,7 @@ def save_results(rows: list, append: bool = False):
         new_df.drop_duplicates(inplace=True)
     new_df.to_csv(OUT_CSV, index=False)
     print(f"Saved {len(new_df)} rows to {OUT_CSV}")
-    upload_to_sheets(new_df)
+    upload_to_sheets(sheet_df)
 
 
 # ----------------------------- MODES -----------------------------
@@ -732,6 +739,7 @@ def auto_run():
             pass
 
     all_new_rows = []
+    snapshot = {}  # ref -> row for the date tab: every open matching notice, new or not
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=HEADLESS)
@@ -751,6 +759,11 @@ def auto_run():
             except Exception:
                 pass
 
+            for item in items:
+                ref = str(item.get("Reference/Solicitation No.", ""))
+                if ref and ref not in snapshot:
+                    snapshot[ref] = {**item, "New?": "" if ref in existing_refs else "Yes"}
+
             # Drop items already in the CSV
             new_items = [
                 item for item in items
@@ -768,7 +781,8 @@ def auto_run():
         browser.close()
 
     print(f"\nTotal new rows this run: {len(all_new_rows)}")
-    save_results(all_new_rows, append=True)
+    print(f"Open matching notices for today's tab: {len(snapshot)} ({len(all_new_rows)} new).")
+    save_results(all_new_rows, append=True, sheet_rows=list(snapshot.values()))
     return all_new_rows
 
 
