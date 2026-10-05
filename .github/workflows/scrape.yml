@@ -33,10 +33,14 @@ jobs:
       - name: Run scraper (ps-philgeps.gov.ph)
         run: python ps_philgeps_scrape.py
 
+      - name: Run project watch (DHSUD ERP)
+        run: python watch_projects.py --headless
+
       - name: Commit updated CSV
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add philgeps_results_public.csv
+          git add watchlist_hits.csv 2>/dev/null || true
           git diff --staged --quiet || git commit -m "chore: update scraped results $(date -u '+%Y-%m-%d')"
           git push
