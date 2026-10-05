@@ -72,7 +72,7 @@ KEYWORDS = {
     "software_it": [
         "software", "web", "website", "mobile", "app", "application",
         "developer", "programmer",
-        "database", "mis", "cms", "lms", "erp",
+        "database", "mis", "cms", "lms", "erp", "enterprise resource planning",
         "it support", "information system", "it system",
         "cybersecurity", "cloud", "api", "integration"
     ],
@@ -668,7 +668,7 @@ def upload_to_sheets(df: pd.DataFrame):
 
         clean_df = df.fillna("")
         data = [clean_df.columns.tolist()] + clean_df.values.tolist()
-        worksheet.update(data, value_input_option="USER_ENTERED")
+        worksheet.update(data, value_input_option="RAW")  # RAW: USER_ENTERED re-parses dd/mm/yyyy dates wrongly
 
         print(f"Google Sheets → tab '{tab_name}': {len(df)} new rows uploaded.")
 
