@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 
 SCRIPT = Path(__file__).parent / "philgeps_scrape.py"
+WATCH = Path(__file__).parent / "watch_projects.py"
 PYTHON = sys.executable  # uses the same venv/interpreter
 
 
@@ -25,6 +26,10 @@ def run_scraper():
         [PYTHON, str(SCRIPT), "--auto", "--headless"]
     )
     print(f"[Scheduler] Scrape finished (exit code {result.returncode}).\n")
+
+    print("[Scheduler] Starting project watch (DHSUD ERP)...")
+    result = subprocess.run([PYTHON, str(WATCH), "--headless"])
+    print(f"[Scheduler] Watch finished (exit code {result.returncode}).\n")
 
 
 # Schedule Mon–Fri at 09:00

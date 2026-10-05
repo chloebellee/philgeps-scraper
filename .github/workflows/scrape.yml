@@ -2,12 +2,13 @@ name: PhilGEPS Daily Scrape
 
 on:
   schedule:
-    - cron: '0 1 * * 1-5'  # 9:00 AM Philippine Time (UTC+8), Mon–Fri
+    - cron: '0 1 * * *'  # 9:00 AM Philippine Time (UTC+8), every day
   workflow_dispatch:        # lets you trigger it manually from GitHub too
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
 
     steps:
       - name: Checkout repo
@@ -34,9 +35,11 @@ jobs:
         run: python ps_philgeps_scrape.py
 
       - name: Run project watch (DHSUD ERP)
+        if: always()
         run: python watch_projects.py --headless
 
       - name: Commit updated CSV
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"

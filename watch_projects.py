@@ -2,8 +2,10 @@
 #
 # Watches PhilGEPS for specific projects, independent of the business-line
 # keyword filter in philgeps_scrape.py. The site's own keyword search returns
-# nothing (even for "software"), so this pages through every result in a set
-# of categories where such a project could be filed and matches on the title.
+# nothing (even for "software"), so this walks every PhilGEPS category (the
+# dropdown is read live, so new categories are picked up) and matches on the
+# title. It also scans the PS-DBM portal (ps-philgeps.gov.ph), where big
+# ERP/IT projects run by PS-DBM are posted instead of on the main site.
 # First-seen hits are appended to watchlist_hits.csv and printed as "NEW HIT".
 #
 # Usage:
@@ -13,6 +15,7 @@ import argparse
 import csv
 import re
 from datetime import date
+import sys
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
@@ -25,13 +28,9 @@ from philgeps_scrape import (
 OUT = Path(__file__).parent / "watchlist_hits.csv"
 FIELDS = ["Watch", "Reference/Solicitation No.", "Title", "URL", "First Seen"]
 
-# IT, integration, internet/telecom, consulting, general services, training
-WATCH_CATEGORIES = [
-    ("10", "Information Technology"), ("108", "Systems Integration"),
-    ("86", "Internet Services"), ("167", "IT Broadcasting and Telecommunications"),
-    ("43", "Consulting Services"), ("23", "Services"),
-    ("178", "Education and Training Services"),
-]
+# Categories that always get scanned first (most likely homes for an ERP notice);
+# every other category in the dropdown is scanned after these.
+PRIORITY_CATEGORIES = ["10", "108", "86", "167", "11", "43", "23", "178"]
 
 # name -> regex the result title must match
 WATCHES = {
@@ -43,6 +42,73 @@ WATCHES = {
         re.I,
     ),
 }
+
+
+def list_categories(ctx):
+    """Return [(id, name)] for every category in the Detailed Search dropdown."""
+    page = ctx.new_page()
+    try:
+        page.goto(OPPS_URL, timeout=60000, wait_until="domcontentloaded",
+                  referer="https://notices.philgeps.gov.ph/")
+        page.wait_for_timeout(2000)
+        page.evaluate("__doPostBack('lbtnDetailed','')")
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
+        page.wait_for_timeout(2000)
+        opts = page.eval_on_selector_all(
+            "select[name='lstCategory'] option",
+            "els => els.map(e => [e.value, e.textContent.trim()])")
+    finally:
+        page.close()
+    seen, cats = set(), []
+    for cid, name in opts:
+        if cid and cid not in seen:
+            seen.add(cid)
+            cats.append((cid, name))
+    first = [c for c in cats if c[0] in PRIORITY_CATEGORIES]
+    first.sort(key=lambda c: PRIORITY_CATEGORIES.index(c[0]))
+    return first + [c for c in cats if c[0] not in PRIORITY_CATEGORIES]
+
+
+def scan_ps_portal(seen, new_rows):
+    """Match watch patterns against the PS-DBM portal's Invitation to Bid list."""
+    from ps_philgeps_scrape import list_items, BASE_URL
+    print("[PS-DBM portal] scanning...")
+    items = list_items()
+    for title, url, item_id in items:
+        for name, pattern in WATCHES.items():
+            ref = f"PSDBM-{item_id}"
+            if not pattern.search(title) or (name, ref) in seen:
+                continue
+            seen.add((name, ref))
+            new_rows.append({
+                "Watch": name, "Reference/Solicitation No.": ref,
+                "Title": title, "URL": url, "First Seen": date.today().isoformat(),
+            })
+            print(f"NEW HIT [{name}] {ref}: {title}\n  {url}")
+    print(f"  scanned {len(items)} PS-DBM notices.")
+
+
+def upload_hits(rows):
+    """Append new hits to a 'Watchlist' tab in the Google Sheet (skipped without credentials)."""
+    from philgeps_scrape import CREDENTIALS_FILE, SHEETS_ID
+    if not rows or not CREDENTIALS_FILE.exists():
+        return
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        creds = Credentials.from_service_account_file(str(CREDENTIALS_FILE), scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"])
+        sheet = gspread.authorize(creds).open_by_key(SHEETS_ID)
+        try:
+            ws = sheet.worksheet("Watchlist")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sheet.add_worksheet(title="Watchlist", rows=200, cols=len(FIELDS))
+            ws.append_row(FIELDS)
+        ws.append_rows([[r[f] for f in FIELDS] for r in rows], value_input_option="RAW")
+        print(f"Google Sheets -> 'Watchlist' tab: {len(rows)} hit(s) added.")
+    except Exception as e:
+        print(f"  Watchlist upload failed: {e}")
 
 
 def search(ctx, cat_id):
@@ -95,7 +161,13 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=args.headless)
         ctx = browser.new_context()
-        for cat_id, cat_name in WATCH_CATEGORIES:
+        try:
+            categories = list_categories(ctx)
+        except Exception as e:
+            print(f"  could not read category list ({type(e).__name__}); using priority list")
+            categories = [(c, c) for c in PRIORITY_CATEGORIES]
+        print(f"Scanning {len(categories)} categories.")
+        for cat_id, cat_name in categories:
             print(f"[{cat_name}] scanning...")
             total = 0
             for attempt in range(1, 4):  # the site times out often
@@ -124,6 +196,12 @@ def main():
                 failed.append(cat_name)
         browser.close()
 
+    try:
+        scan_ps_portal(seen, new_rows)
+    except Exception as e:
+        print(f"  PS-DBM portal scan failed: {type(e).__name__}: {e}")
+        failed.append("PS-DBM portal")
+
     if new_rows:
         write_header = not OUT.exists()
         with open(OUT, "a", newline="", encoding="utf-8") as f:
@@ -131,6 +209,7 @@ def main():
             if write_header:
                 w.writeheader()
             w.writerows(new_rows)
+        upload_hits(new_rows)
     if failed:
         print(f"WARNING: could not scan: {', '.join(failed)}")
     print(f"Done. {len(new_rows)} new hit(s) total.")
