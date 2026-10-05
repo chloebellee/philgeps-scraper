@@ -23,6 +23,8 @@ from playwright.sync_api import sync_playwright
 from philgeps_scrape import (
     OPPS_URL, MAX_PAGES_PER_KEYWORD, click_next_page, pick_best_node,
     wait_for_results, absolutize, extract_refid_from_string, text_clean,
+    make_detail_urls, scrape_detail_info, extract_abc_from_info, info_pick,
+    parse_abc_numeric, match_business_line,
 )
 
 OUT = Path(__file__).parent / "watchlist_hits.csv"
@@ -69,7 +71,7 @@ def list_categories(ctx):
     return first + [c for c in cats if c[0] not in PRIORITY_CATEGORIES]
 
 
-def scan_ps_portal(seen, new_rows):
+def scan_ps_portal(seen, new_rows, main_rows):
     """Match watch patterns against the PS-DBM portal's Invitation to Bid list."""
     from ps_philgeps_scrape import list_items, BASE_URL
     print("[PS-DBM portal] scanning...")
@@ -85,7 +87,81 @@ def scan_ps_portal(seen, new_rows):
                 "Title": title, "URL": url, "First Seen": date.today().isoformat(),
             })
             print(f"NEW HIT [{name}] {ref}: {title}\n  {url}")
+            main_rows.append({
+                "Project/Title": title, "Procuring Entity": "", "Classification": "",
+                "Category": "", "Procurement Mode": "", "ABC": "", "ABC_Numeric": None,
+                "Area of Delivery": "", "Posting Date": "", "Closing/Deadline": "",
+                "Reference/Solicitation No.": ref,
+                "Business Line": match_business_line(title) or "software_it",
+                "URL": url, "Detail URL Used": "",
+            })
     print(f"  scanned {len(items)} PS-DBM notices.")
+
+
+def build_main_row(ctx, refid, title, url):
+    """Full main-data row for a watch hit (same columns as philgeps_scrape), skipping its filters."""
+    detail_used, info = "", {}
+    for u in make_detail_urls(url, refid):
+        info = scrape_detail_info(ctx, u)
+        if info:
+            detail_used = u
+            break
+    project = info.get("procurement project", "") or info.get("title", "") or title
+    category = info.get("category", "")
+    abc = extract_abc_from_info(info)
+    return {
+        "Project/Title": text_clean(project),
+        "Procuring Entity": text_clean(info.get("procuring entity", "")),
+        "Classification": text_clean(info.get("classification", "")),
+        "Category": text_clean(category),
+        "Procurement Mode": text_clean(info.get("procurement mode", "") or info.get("mode of procurement", "")),
+        "ABC": text_clean(abc),
+        "ABC_Numeric": parse_abc_numeric(abc),
+        "Area of Delivery": text_clean(info.get("area of delivery", "")),
+        "Posting Date": text_clean(info_pick(info, "posting date", "date published", "date issued", "date posted")),
+        "Closing/Deadline": text_clean(info_pick(
+            info, "closing date", "closing date / time", "closing date/time",
+            "closing date & time", "deadline of submission", "closing date and time")),
+        "Reference/Solicitation No.": text_clean(
+            info.get("reference number", "") or info.get("solicitation number", "") or refid),
+        "Business Line": match_business_line(project, category) or "software_it",
+        "URL": url,
+        "Detail URL Used": detail_used,
+    }
+
+
+def add_to_main_data(rows):
+    """Merge watch hits into the main CSV and append them to today's date tab in the Sheet.
+
+    Appends (never clears) the tab: the main scraper has already written today's rows there.
+    """
+    if not rows:
+        return
+    from ps_philgeps_scrape import save_csv_only
+    from philgeps_scrape import CREDENTIALS_FILE, SHEETS_ID
+    save_csv_only(rows)
+    if not CREDENTIALS_FILE.exists():
+        return
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        creds = Credentials.from_service_account_file(str(CREDENTIALS_FILE), scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"])
+        sheet = gspread.authorize(creds).open_by_key(SHEETS_ID)
+        tab = date.today().strftime("%B %-d")
+        cols = list(rows[0].keys())
+        try:
+            ws = sheet.worksheet(tab)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sheet.add_worksheet(title=tab, rows=500, cols=20)
+            sheet.reorder_worksheets([ws] + [w for w in sheet.worksheets() if w.title != tab])
+            ws.append_row(cols)
+        ws.append_rows([["" if r[c] is None else r[c] for c in cols] for r in rows],
+                       value_input_option="RAW")
+        print(f"Google Sheets -> tab '{tab}': {len(rows)} watch hit(s) appended.")
+    except Exception as e:
+        print(f"  Daily-tab upload failed: {e}")
 
 
 def upload_hits(rows):
@@ -157,7 +233,7 @@ def main():
         with open(OUT, newline="", encoding="utf-8") as f:
             seen = {(r["Watch"], r["Reference/Solicitation No."]) for r in csv.DictReader(f)}
 
-    new_rows, failed = [], []
+    new_rows, main_rows, failed = [], [], []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=args.headless)
         ctx = browser.new_context()
@@ -185,6 +261,19 @@ def main():
                                 "Title": title, "URL": url, "First Seen": date.today().isoformat(),
                             })
                             print(f"NEW HIT [{name}] {refid}: {title}\n  {url}")
+                            try:
+                                main_rows.append(build_main_row(ctx, refid, title, url))
+                            except Exception as e:
+                                print(f"  could not fetch details ({type(e).__name__}); using title only")
+                                main_rows.append({
+                                    "Project/Title": title, "Procuring Entity": "",
+                                    "Classification": "", "Category": "", "Procurement Mode": "",
+                                    "ABC": "", "ABC_Numeric": None, "Area of Delivery": "",
+                                    "Posting Date": "", "Closing/Deadline": "",
+                                    "Reference/Solicitation No.": refid,
+                                    "Business Line": match_business_line(title) or "software_it",
+                                    "URL": url, "Detail URL Used": "",
+                                })
                     print(f"  scanned {total} notices.")
                     break
                 except Exception as e:
@@ -197,7 +286,7 @@ def main():
         browser.close()
 
     try:
-        scan_ps_portal(seen, new_rows)
+        scan_ps_portal(seen, new_rows, main_rows)
     except Exception as e:
         print(f"  PS-DBM portal scan failed: {type(e).__name__}: {e}")
         failed.append("PS-DBM portal")
@@ -210,6 +299,7 @@ def main():
                 w.writeheader()
             w.writerows(new_rows)
         upload_hits(new_rows)
+        add_to_main_data(main_rows)
     if failed:
         print(f"WARNING: could not scan: {', '.join(failed)}")
     print(f"Done. {len(new_rows)} new hit(s) total.")
